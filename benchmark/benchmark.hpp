@@ -111,22 +111,21 @@ static constexpr size_t CPU_AFFINITY_OFFSET = 0;
 
 static constexpr char VIPER_POOL_FILE[] = "/pmem0/viper";
 
-// 【关键修改】指向你的实际 PMem 挂载点
+// 【关键修改】指向你的实际 PMem 挂载点 (这个不用动，硬件挂载点没变)
 static constexpr char DB_PMEM_DIR[] = "/pmem0";
 
-// 【修改】指向项目目录下的 data 文件夹 (稍后需手动创建)
-static constexpr char DB_FILE_DIR[] = "/root/viper/data/";
+// 【修改】指向项目目录下的 data 文件夹
+static constexpr char DB_FILE_DIR[] = "/root/NovaKV/data/";
 
 // 【修改】指向项目目录下的 results 文件夹
-static constexpr char RESULT_FILE_DIR[] = "/root/viper/results/";
+static constexpr char RESULT_FILE_DIR[] = "/root/NovaKV/results/";
 
 // 【修改】指向实际的 config 路径
-static constexpr char CONFIG_DIR[] = "/root/viper/benchmark/config/";
+static constexpr char CONFIG_DIR[] = "/root/NovaKV/benchmark/config/";
 
-// CPU 绑定偏移量，通常设为 0；如果是双路 CPU 且想绑在第二个 Socket，需改为 36 或 48 (取决于 lscpu)
+// CPU 绑定偏移量，通常设为 0
 static constexpr size_t CPU_AFFINITY_OFFSET = 0;
 #endif
-
 static constexpr uint64_t ONE_GB = (1024ul*1024*1024) * 1;  // 1GB
 static constexpr uint64_t BM_POOL_SIZE = ONE_GB* 64;
 

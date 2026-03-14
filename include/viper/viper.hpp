@@ -13,6 +13,7 @@
 #include <assert.h>
 #include <filesystem>
 #include <immintrin.h>
+#include <sched.h>  // 引入 sched_getcpu()
 
 #include "cceh.hpp"
 #include "concurrentqueue.h"
@@ -439,7 +440,14 @@ class Viper {
     std::atomic<size_t> num_v_blocks_;
     std::atomic<size_t> current_size_;
     std::atomic<size_t> reclaimable_ops_;
-    std::atomic<offset_size_t> current_block_page_;
+    //std::atomic<offset_size_t> current_block_page_;
+    // ======== [核心创新：NUMA/多核感知的分布式分配器] ========
+    static constexpr int NUM_ALLOC_ZONES = 36; // 切分为 36 个独立分配区
+    struct alignas(64) AllocZone {             // 64字节对齐，彻底消除伪共享(False Sharing)
+        std::atomic<offset_size_t> current_block_page;
+    };
+    std::array<AllocZone, NUM_ALLOC_ZONES> alloc_zones_;
+    // ==========================================================
     moodycamel::ConcurrentQueue<block_size_t> free_blocks_;
 
     const double resize_threshold_;
@@ -475,7 +483,7 @@ Viper<K, V>::Viper(ViperBase v_base, const std::filesystem::path pool_dir, const
     v_base_{v_base}, map_{131072}, owns_pool_{owns_pool}, v_config_{v_config}, pool_dir_{pool_dir},
     resize_threshold_{v_config.resize_threshold}, reclaim_threshold_{v_config.reclaim_threshold},
     num_recovery_threads_{v_config.num_recovery_threads} {
-    current_block_page_ = 0;
+    //current_block_page_ = 0;
     current_size_ = 0;
     reclaimable_ops_ = 0;
     is_resizing_ = false;
@@ -497,7 +505,22 @@ Viper<K, V>::Viper(ViperBase v_base, const std::filesystem::path pool_dir, const
         DEBUG_LOG("Recovering existing database.");
         recover_database();
     }
-    current_block_page_ = KVOffset{v_base.v_metadata->num_used_blocks.load(LOAD_ORDER), 0, 0}.offset;
+    // ======== [NUMA 改造：为 36 个核心分配区设置初始起始块] ========
+    // 获取当前元数据中记录的已使用块数作为起始基准
+    block_size_t start_block = v_base_.v_metadata->num_used_blocks.load(LOAD_ORDER);
+    
+    for (int i = 0; i < NUM_ALLOC_ZONES; ++i) {
+        // 每个 Zone 分配一个独立的初始块，序号交错开 (start_block + 0, + 1, + 2...)
+        alloc_zones_[i].current_block_page.store(
+            KVOffset{start_block + i, 0, 0}.offset, 
+            STORE_ORDER
+        );
+    }
+    
+    // 更新元数据：因为我们预分配了 36 个块，所以已用块数要增加 36
+    v_base_.v_metadata->num_used_blocks.fetch_add(NUM_ALLOC_ZONES, std::memory_order_relaxed);
+    internal::pmem_persist(v_base_.v_metadata, sizeof(ViperFileMetadata));
+    // ============================================================
 }
 
 template <typename K, typename V>
@@ -857,10 +880,15 @@ void Viper<K, V>::get_new_access_information(Client* client) {
     // Get insert/delete count info
     client->info_sync(true);
 
-    const KVOffset block_page{current_block_page_.load(LOAD_ORDER)};
-    if (block_page.block_number > resize_threshold_ * v_blocks_.size()) {
+    // const KVOffset block_page{current_block_page_.load(LOAD_ORDER)};
+    // if (block_page.block_number > resize_threshold_ * v_blocks_.size()) {
+    //     trigger_resize();
+    // }
+    // ======== [NUMA 改造：使用元数据中的全局已用块数来判断是否需要扩容] ========
+    if (v_base_.v_metadata->num_used_blocks.load(LOAD_ORDER) > resize_threshold_ * v_blocks_.size()) {
         trigger_resize();
     }
+    // =======================================================================
 
     get_block_based_access(client);
 }
@@ -913,28 +941,68 @@ void Viper<K, V>::get_block_based_access(Client* client) {
     internal::pmem_persist(v_base_.v_metadata, sizeof(ViperFileMetadata));
 }
 
+// template <typename K, typename V>
+// KeyValueOffset Viper<K, V>::get_new_block() {
+//     offset_size_t raw_block_page = current_block_page_.load(LOAD_ORDER);
+//     KVOffset new_offset{};
+//     block_size_t client_block;
+//     do {
+//         const KVOffset v_block_page{raw_block_page};
+//         client_block = v_block_page.block_number;
+
+//         const block_size_t new_block = client_block + 1;
+//         while (client_block >= num_v_blocks_.load(LOAD_ORDER)) {
+//             asm("nop");
+//         }
+//         assert(new_block < v_blocks_.size());
+
+//         // Choose random offset to evenly distribute load on all DIMMs
+//         page_size_t new_page = 0;
+//         if constexpr (!std::is_same_v<std::string, K>) {
+//             new_page = rand() % num_pages_per_block;
+//         }
+//         new_offset = KVOffset{new_block, new_page, 0};
+//     } while (!current_block_page_.compare_exchange_weak(raw_block_page, new_offset.offset));
+
+//     return KVOffset{raw_block_page};
+// }
+
 template <typename K, typename V>
 KeyValueOffset Viper<K, V>::get_new_block() {
-    offset_size_t raw_block_page = current_block_page_.load(LOAD_ORDER);
+    // 1. 获取当前线程运行在哪个物理核心上
+    int cpu = sched_getcpu();
+    if (cpu < 0) cpu = 0; // 兜底保护
+    
+    // 2. 映射到专属的 Allocation Zone，完美避开跨核心的锁竞争！
+    int zone_idx = cpu % NUM_ALLOC_ZONES; 
+    
+    // 获取该核心专属分配区的偏移量
+    offset_size_t raw_block_page = alloc_zones_[zone_idx].current_block_page.load(LOAD_ORDER);
     KVOffset new_offset{};
     block_size_t client_block;
+    
     do {
         const KVOffset v_block_page{raw_block_page};
         client_block = v_block_page.block_number;
 
-        const block_size_t new_block = client_block + 1;
+        // 3. 核心精髓：Stride Allocation (交错分配)。
+        // 每个核心分配的块序号是：CPU_ID, CPU_ID + 36, CPU_ID + 72...
+        // 这样 36 个核心分配的物理块永远不会碰撞！
+        const block_size_t new_block = client_block + NUM_ALLOC_ZONES; 
+        
         while (client_block >= num_v_blocks_.load(LOAD_ORDER)) {
-            asm("nop");
+            asm("nop"); // 等待后台线程扩容
         }
         assert(new_block < v_blocks_.size());
 
-        // Choose random offset to evenly distribute load on all DIMMs
+        // 保持原有的随机页偏移，分摊 DIMM 带宽压力
         page_size_t new_page = 0;
         if constexpr (!std::is_same_v<std::string, K>) {
             new_page = rand() % num_pages_per_block;
         }
         new_offset = KVOffset{new_block, new_page, 0};
-    } while (!current_block_page_.compare_exchange_weak(raw_block_page, new_offset.offset));
+        
+    } while (!alloc_zones_[zone_idx].current_block_page.compare_exchange_weak(raw_block_page, new_offset.offset));
 
     return KVOffset{raw_block_page};
 }
@@ -1021,6 +1089,36 @@ inline bool Viper<K, V>::check_key_equality(const K& key, const KVOffset offset_
 
 template <typename K, typename V>
 bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_old) {
+    
+    // ======== [核心创新：In-place Update (原地更新) 拦截逻辑] ========
+    // 1. 先查索引，看这个 Key 是不是已经存在（判断是 Insert 还是 Update）
+    auto key_check_fn = [&](auto k, auto offset) {
+        if constexpr (using_fp) { return this->viper_.check_key_equality(k, offset); }
+        else { return cceh::CCEH<K>::dummy_key_check(k, offset); }
+    };
+    
+    KVOffset existing_offset = this->viper_.map_.Get(key, key_check_fn);
+    
+    if (!existing_offset.is_tombstone()) {
+        // 2. 如果存在（这是一个 Update 操作），直接原地覆盖旧地址的 Value！
+        const auto [block, page, slot] = existing_offset.get_offsets();
+        VPage& old_v_page = this->viper_.v_blocks_[block]->v_pages[page];
+        
+        // 尝试锁住这块旧的 PMem 页 (非阻塞锁，抢不到就去走常规的新增逻辑)
+        if (old_v_page.lock(false)) { 
+            // 利用 PMem 的字节寻址特性，直接覆盖内存
+            old_v_page.data[slot].second = value; 
+            // 刷入持久化设备，确保数据安全落盘
+            internal::pmem_persist(&old_v_page.data[slot].second, sizeof(V)); 
+            old_v_page.unlock();
+            
+            // 返回 false 表示这不是新的 Key。原地更新完成，提前结束！不产生任何垃圾！
+            return false; 
+        }
+    }
+    // ==============================================================
+
+    // ======== 下面是原版 Viper 的 Insert (追加写) 逻辑 ========
     v_page_->lock();
 
     // We now have the lock on this page
@@ -1047,8 +1145,8 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
     KVOffset old_offset;
 
     if constexpr (using_fp) {
-        auto key_check_fn = [&](auto key, auto offset) { return this->viper_.check_key_equality(key, offset); };
-        old_offset = this->viper_.map_.Insert(key, kv_offset, key_check_fn);
+        auto insert_key_check_fn = [&](auto k, auto offset) { return this->viper_.check_key_equality(k, offset); };
+        old_offset = this->viper_.map_.Insert(key, kv_offset, insert_key_check_fn);
     } else {
         old_offset = this->viper_.map_.Insert(key, kv_offset);
     }
@@ -1690,7 +1788,8 @@ void Viper<std::string, std::string>::compact(Client& client, VPageBlock* v_bloc
 template <typename K, typename V>
 void Viper<K, V>::reclaim() {
     const size_t num_slots_per_block = num_pages_per_block * VPage::num_slots_per_page;
-    const block_size_t max_block = KVOffset{current_block_page_.load(LOAD_ORDER)}.block_number;
+    //const block_size_t max_block = KVOffset{current_block_page_.load(LOAD_ORDER)}.block_number;
+    const block_size_t max_block = v_base_.v_metadata->num_used_blocks.load(LOAD_ORDER);
 
     // At least X percent of the block should be free before reclaiming it.
     const size_t free_threshold = v_config_.reclaim_free_percentage * num_slots_per_block;
@@ -1723,7 +1822,8 @@ void Viper<K, V>::reclaim() {
 
 template <>
 void Viper<std::string, std::string>::reclaim() {
-    const block_size_t max_block = KVOffset{current_block_page_.load(LOAD_ORDER)}.block_number;
+    //const block_size_t max_block = KVOffset{current_block_page_.load(LOAD_ORDER)}.block_number;
+    const block_size_t max_block = v_base_.v_metadata->num_used_blocks.load(LOAD_ORDER);
     const double modified_threshold = v_config_.reclaim_free_percentage;
     size_t total_freed_blocks = 0;
     Client client = get_client();
