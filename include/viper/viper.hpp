@@ -165,18 +165,23 @@ struct VarEntryAccessor {
     }
 };
 
+// 1. 新增：复合槽位结构体（将锁和数据物理绑定，强行拉开物理距离，消灭伪共享）
+template <typename K, typename V>
+struct VSlot {
+    std::atomic<version_lock_t> slot_lock; 
+    std::pair<K, V> data; 
+};
+
 template <typename K, typename V>
 struct alignas(PAGE_SIZE) ViperPage {
     using VEntry = std::pair<K, V>;
     static constexpr data_offset_size_t num_slots_per_page = get_num_slots_per_page<K, V>();
 
-    std::atomic<version_lock_t> version_lock; // 保留页级锁，用于 Insert 时保护 free_slots
-    
-    // 🚀 修改点：新增槽位级 1 Byte 原子锁数组
-    std::array<std::atomic<version_lock_t>, num_slots_per_page> slot_locks;
-
+    std::atomic<version_lock_t> version_lock; // 保留原版页级锁
     std::bitset<num_slots_per_page> free_slots;
-    std::array<VEntry, num_slots_per_page> data;
+    
+    // 2. 核心修改：使用复合槽位数组，替代原来的 slot_locks 和 data 两个独立数组
+    std::array<VSlot<K, V>, num_slots_per_page> slots;
 
     void init() {
         static constexpr size_t v_page_size = sizeof(*this);
@@ -185,36 +190,41 @@ struct alignas(PAGE_SIZE) ViperPage {
         version_lock = USED_BIT;
         free_slots.set();
         
-        // 🚀 修改点：初始化所有槽位锁为 0（解锁状态）
+        // 3. 初始化所有槽位锁
         for (size_t i = 0; i < num_slots_per_page; ++i) {
-            slot_locks[i].store(0, std::memory_order_relaxed);
+            slots[i].slot_lock.store(0, std::memory_order_relaxed);
         }
     }
     
-    // 🚀 修改点：新增槽位专用的加锁方法 (非阻塞乐观锁)
+    // 4. 槽位加锁（加入指数退避，防止CAS风暴卡死硬件总线）
     inline bool lock_slot(size_t slot, const bool blocking = true) {
-        version_lock_t lock_value = slot_locks[slot].load(LOAD_ORDER);
+        auto& target_lock = slots[slot].slot_lock;
+        version_lock_t lock_value = target_lock.load(LOAD_ORDER);
         lock_value &= UNLOCKED_BIT;
-        while (!slot_locks[slot].compare_exchange_weak(lock_value, lock_value + 1)) {
+        
+        int backoff = 1;
+        while (!target_lock.compare_exchange_weak(lock_value, lock_value + 1)) {
             lock_value &= UNLOCKED_BIT;
             if (!blocking) { return false; }
-            _mm_pause(); // 硬件退避
+            
+            for (int i = 0; i < backoff; ++i) {
+                _mm_pause(); // 硬件退避
+            }
+            if (backoff < 32) backoff *= 2;
         }
         return true;
     }
 
-    // 🚀 修改点：新增槽位专用的解锁方法
+    // 5. 槽位解锁
     inline void unlock_slot(size_t slot) {
-        const version_lock_t current = slot_locks[slot].load(LOAD_ORDER);
+        const version_lock_t current = slots[slot].slot_lock.load(LOAD_ORDER);
         version_lock_t new_version = (current + 1) % USED_BIT;
-        slot_locks[slot].store(new_version, STORE_ORDER);
+        slots[slot].slot_lock.store(new_version, STORE_ORDER);
     }
 
-    // ... 下面原版的 inline bool lock() 和 inline void unlock() 保持不动！ ...
-
+    // --- 下面原版的 lock() 和 unlock() 保持不动 ---
     inline bool lock(const bool blocking = true) {
         version_lock_t lock_value = version_lock.load(LOAD_ORDER);
-        // Compare and swap until we are the thread to set the lock bit
         lock_value &= UNLOCKED_BIT;
         while (!version_lock.compare_exchange_weak(lock_value, lock_value + 1)) {
             lock_value &= UNLOCKED_BIT;
@@ -871,7 +881,7 @@ void Viper<K, V>::recover_database() {
                     }
 
                     // Data is present
-                    const K& key = page.data[slot_num].first;
+                    const K& key = page.slots[slot_num].data.first;
                     const KVOffset offset{block_num, page_num, slot_num};
                     map_.Insert(key, offset, key_check_fn);
                     num_entries++;
@@ -1134,11 +1144,14 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
         const auto [block, page, slot] = existing_offset.get_offsets();
         VPage& old_v_page = this->viper_.v_blocks_[block]->v_pages[page];
         
+        // 🌟 新增这一行：在抢锁前，命令 CPU 把数据先搬进 L1 缓存
+        _mm_prefetch(reinterpret_cast<const char*>(&old_v_page.slots[slot]), _MM_HINT_T0);
+
         // 🚀 编译期隔离：如果不是 std::string，才能使用槽位锁进行原地更新！
         if constexpr (!std::is_same_v<K, std::string>) {
             if (old_v_page.lock_slot(slot, false)) { 
-                old_v_page.data[slot].second = value; 
-                internal::pmem_persist(&old_v_page.data[slot].second, sizeof(V)); 
+                old_v_page.slots[slot].data.second = value; 
+                internal::pmem_persist(&old_v_page.slots[slot].data.second, sizeof(V)); 
                 old_v_page.unlock_slot(slot);
                 return false; 
             }
@@ -1164,8 +1177,8 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
     }
 
     // We have found a free slot on this page. Persist data.
-    v_page_->data[free_slot_idx] = {key, value};
-    typename VPage::VEntry* entry_ptr = v_page_->data.data() + free_slot_idx;
+    v_page_->slots[free_slot_idx].data = {key, value};
+    typename VPage::VEntry* entry_ptr = &v_page_->slots[free_slot_idx].data;
     internal::pmem_persist(entry_ptr, sizeof(typename VPage::VEntry));
 
     free_slots->reset(free_slot_idx);
@@ -1403,7 +1416,7 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
             continue;
         }
 
-        update_fn(&(v_page.data[slot].second));
+        update_fn(&(v_page.slots[slot].data.second));
         v_page.unlock();
         return true;
     }
@@ -1649,7 +1662,7 @@ Viper<K, V>::ReadOnlyClient::get_const_entry_from_offset(Viper::KVOffset offset)
         return {var_entry.key(), var_entry.value()};
     } else {
         const auto[block, page, slot] = offset.get_offsets();
-        const auto& entry = this->viper_.v_blocks_[block]->v_pages[page].data[slot];
+        const auto& entry = this->viper_.v_blocks_[block]->v_pages[page].slots[slot].data;
         return {&entry.first, &entry.second};
     }
 }
@@ -1683,7 +1696,7 @@ inline bool Viper<K, V>::ReadOnlyClient::get_const_value_from_offset(KVOffset of
 
         return lock_val == v_page.version_lock.load(LOAD_ORDER);
     } else {
-        const std::atomic<version_lock_t>& slot_lock = v_page.slot_locks[slot];
+        const std::atomic<version_lock_t>& slot_lock = v_page.slots[slot].slot_lock;
         version_lock_t lock_val = slot_lock.load(LOAD_ORDER);
         if (IS_LOCKED(lock_val)) return false;
 
@@ -1720,11 +1733,11 @@ inline bool Viper<K, V>::Client::get_value_from_offset(KVOffset offset, V* value
 
         return lock_val == v_page.version_lock.load(LOAD_ORDER);
     } else {
-        const std::atomic<version_lock_t>& slot_lock = v_page.slot_locks[slot];
+        const std::atomic<version_lock_t>& slot_lock = v_page.slots[slot].slot_lock;
         version_lock_t lock_val = slot_lock.load(LOAD_ORDER);
         if (IS_LOCKED(lock_val)) return false;
 
-        *value = v_page.data[slot].second;
+        *value = v_page.slots[slot].data.second;
 
         return lock_val == slot_lock.load(LOAD_ORDER);
     }
@@ -1741,7 +1754,7 @@ void Viper<K, V>::compact(Client& client, VPageBlock* v_block) {
                 continue;
             }
 
-            const auto& record = v_page.data[slot];
+            const auto& record = v_page.slots[slot].data;
             client.put(record.first, record.second, false);
             free_slots[slot] = 1;
             internal::pmem_persist(&v_page.free_slots, sizeof(v_page.free_slots));
