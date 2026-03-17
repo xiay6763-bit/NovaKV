@@ -17,3 +17,11 @@ ycsb*.png
 benchmark/ycsb-*/
 # 忽略 YCSB 的压缩包
 benchmark/*.tar.gz
+
+# 忽略零散的编译目标文件和静态库
+*.o
+*.a
+*.so
+
+# 忽略挂载的 PMem 傲腾内存数据目录（极其重要，动辄几十GB）
+/pmem0/

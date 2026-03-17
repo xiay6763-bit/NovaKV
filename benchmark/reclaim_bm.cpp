@@ -42,7 +42,7 @@ inline void bm_reclaim(benchmark::State& state, VFixture& fixture, std::string m
 
     set_cpu_affinity(state.thread_index());
 
-    const size_t num_prefills = method == "READ" ? 100'000'000 : 10'000'000;
+    const size_t num_prefills = 1'000'000;
     const size_t num_deletes = num_prefills / 3;
     const size_t num_total_values = num_prefills * 2;
 
@@ -121,7 +121,8 @@ inline void bm_reclaim(benchmark::State& state, VFixture& fixture, std::string m
 }
 
 //DEFINE_FIXED_BM(WRITE);
-DEFINE_FIXED_BM(READ);
+//DEFINE_FIXED_BM(READ);
+DEFINE_FIXED_BM(INSERT);
 //DEFINE_FIXED_BM(MIXED);
 
 //DEFINE_VAR_BM(READ);

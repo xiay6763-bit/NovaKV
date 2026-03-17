@@ -16,13 +16,19 @@
 
 using namespace viper::kv_bm;
 
-constexpr size_t ALL_OPS_NUM_REPETITIONS = 1;
-constexpr size_t ALL_OPS_NUM_PREFILLS = 100'000'000;
-constexpr size_t ALL_OPS_NUM_INSERTS = 50'000'000;
-constexpr size_t ALL_OPS_NUM_FINDS = 50'000'000;
-constexpr size_t ALL_OPS_NUM_UPDATES = 50'000'000;
-constexpr size_t ALL_OPS_NUM_DELETES = 50'000'000;
+// constexpr size_t ALL_OPS_NUM_REPETITIONS = 1;
+// constexpr size_t ALL_OPS_NUM_PREFILLS = 100'000'000;
+// constexpr size_t ALL_OPS_NUM_INSERTS = 50'000'000;
+// constexpr size_t ALL_OPS_NUM_FINDS = 50'000'000;
+// constexpr size_t ALL_OPS_NUM_UPDATES = 50'000'000;
+// constexpr size_t ALL_OPS_NUM_DELETES = 50'000'000;
 
+constexpr size_t ALL_OPS_NUM_REPETITIONS = 1;
+constexpr size_t ALL_OPS_NUM_PREFILLS = 1'000'000; // 降到 100 万
+constexpr size_t ALL_OPS_NUM_INSERTS = 1'000'000;  // 降到 100 万
+constexpr size_t ALL_OPS_NUM_FINDS = 1'000'000;    // 降到 100 万
+constexpr size_t ALL_OPS_NUM_UPDATES = 1'000'000;  // 降到 100 万
+constexpr size_t ALL_OPS_NUM_DELETES = 1'000'000;  // 降到 100 万
 #define GENERAL_ARGS \
               Repetitions(ALL_OPS_NUM_REPETITIONS) \
             ->Iterations(1) \
